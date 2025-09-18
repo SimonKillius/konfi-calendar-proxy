@@ -45,7 +45,48 @@ jobs:
               -H "Pragma: no-cache" \
               -A "curl/8.x github-actions" \
               --retry 6 --retry-delay 10 --retry-all-errors --retry-connrefused \
+              "$URL" -o source.ics || true       - name: Fetch ICS with retries (non-fatal on 500)
+        id: fetch
+        env:
+          SOURCE_ICS_URL: ${{ secrets.SOURCE_ICS_URL }}
+        run: |
+          set -e
+          echo "Fetching $SOURCE_ICS_URL"
+
+          # Cache-Buster gegen launische Server/Caches
+          TS=$(date +%s)
+          URL="$SOURCE_ICS_URL"
+          case "$URL" in
+            *\?*) URL="${URL}&nocache=${TS}" ;;
+            *)    URL="${URL}?nocache=${TS}" ;;
+          esac
+
+          # Versuch 1 (mehrfach, 'freundliche' Header)
+          curl -fsSL \
+            -H "Accept: text/calendar" \
+            -H "Cache-Control: no-cache" \
+            -A "Mozilla/5.0 (compatible; ICSFetcher/1.0)" \
+            --retry 6 --retry-delay 10 --retry-all-errors --retry-connrefused \
+            "$URL" -o source.ics || true
+
+          # Wenn noch nichts da: Versuch 2 (alternative Header/Agent)
+          if [ ! -s source.ics ]; then
+            curl -fsSL \
+              -H "Accept: */*" \
+              -H "Pragma: no-cache" \
+              -A "curl/8.x github-actions" \
+              --retry 6 --retry-delay 10 --retry-all-errors --retry-connrefused \
               "$URL" -o source.ics || true
+          fi
+
+          # Validierung: Nur wenn wirklich ICS, dann "valid=true"
+          if [ -s source.ics ] && head -n 1 source.ics | grep -q "BEGIN:VCALENDAR"; then
+            echo "valid=true" >> $GITHUB_OUTPUT
+          else
+            echo "WARN: Keine gültige ICS (500/HTML). Behalte letzte Version."
+            echo "valid=false" >> $GITHUB_OUTPUT
+          fi
+
           fi
 
           # Wenn wir hier keine gueltige ICS haben, scheitern wir NICHT,
