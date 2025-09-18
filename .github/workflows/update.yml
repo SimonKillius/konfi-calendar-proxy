@@ -1,0 +1,48 @@
+name: Update ICS (Europe/Berlin)
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # alle 6 Stunden (UTC-Zeit!)
+  workflow_dispatch:         # manueller Start möglich
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch ICS
+        env:
+          SOURCE_ICS_URL: ${{ secrets.SOURCE_ICS_URL }}
+        run: |
+          set -e
+          curl -fsSL "$SOURCE_ICS_URL" -o source.ics
+          # Kurzer Plausibilitätscheck: Muss mit BEGIN:VCALENDAR beginnen
+          head -n 1 source.ics | grep -q "BEGIN:VCALENDAR"
+
+      - name: Normalize timezone to Europe/Berlin
+        run: |
+          # Windows-TZ -> IANA-TZ
+          sed -e 's/TZID:W\. Europe Standard Time/TZID:Europe\/Berlin/g' \
+              -e 's/DTSTART;TZID=W\. Europe Standard Time/DTSTART;TZID=Europe\/Berlin/g' \
+              -e 's/DTEND;TZID=W\. Europe Standard Time/DTEND;TZID=Europe\/Berlin/g' \
+              source.ics > konfi.ics
+          # (Optional) X-WR-TIMEZONE ergänzen, falls nicht vorhanden
+          if ! grep -q "^X-WR-TIMEZONE:" konfi.ics; then
+            awk '1; /^X-WR-CALNAME:/ {print "X-WR-TIMEZONE:Europe/Berlin"}' konfi.ics > tmp && mv tmp konfi.ics
+          fi
+
+      - name: Commit updated ICS (only if changed)
+        run: |
+          set -e
+          git config user.name  "calendar-bot"
+          git config user.email "bot@example.com"
+          # Falls Datei neu/anders ist, committen
+          if ! git diff --quiet -- konfi.ics 2>/dev/null; then
+            git add konfi.ics
+            git commit -m "Update ICS (auto)"
+            git push
+          else
+            echo "No changes."
+          fi
