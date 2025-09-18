@@ -2,8 +2,11 @@ name: Update ICS (Europe/Berlin)
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # alle 6 Stunden (UTC-Zeit!)
-  workflow_dispatch:         # manueller Start möglich
+    - cron: "0 */6 * * *"     # alle 6h (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: write             # erlaubt Commit/Push
 
 jobs:
   build:
@@ -12,34 +15,53 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Fetch ICS
+      - name: Fetch ICS with retries (alternate headers & agents)
         env:
           SOURCE_ICS_URL: ${{ secrets.SOURCE_ICS_URL }}
         run: |
           set -e
-          curl -fsSL "$SOURCE_ICS_URL" -o source.ics
-          # Kurzer Plausibilitätscheck: Muss mit BEGIN:VCALENDAR beginnen
-          head -n 1 source.ics | grep -q "BEGIN:VCALENDAR"
+          echo "Fetching $SOURCE_ICS_URL"
+
+          # Versuchsreihe 1: sauberer Kalender-Request + Backoff
+          if ! curl -fsSL \
+               -H "Accept: text/calendar" \
+               -H "Cache-Control: no-cache" \
+               -A "Mozilla/5.0 (compatible; ICSFetcher/1.0)" \
+               --retry 6 --retry-delay 10 --retry-all-errors \
+               "$SOURCE_ICS_URL" -o source.ics; then
+            echo "Try #1 failed, trying alternative headers/agent..."
+            # Versuchsreihe 2: andere Header/Agent
+            curl -fsSL \
+              -H "Accept: */*" \
+              -H "Pragma: no-cache" \
+              -A "curl/8.x github-actions" \
+              --retry 6 --retry-delay 10 --retry-all-errors \
+              "$SOURCE_ICS_URL" -o source.ics
+          fi
+
+          # Minimal-Validierung: muss wirklich iCalendar sein
+          head -n 1 source.ics | grep -q "BEGIN:VCALENDAR" || { echo "Not an ICS"; exit 1; }
 
       - name: Normalize timezone to Europe/Berlin
         run: |
-          # Windows-TZ -> IANA-TZ
           sed -e 's/TZID:W\. Europe Standard Time/TZID:Europe\/Berlin/g' \
               -e 's/DTSTART;TZID=W\. Europe Standard Time/DTSTART;TZID=Europe\/Berlin/g' \
               -e 's/DTEND;TZID=W\. Europe Standard Time/DTEND;TZID=Europe\/Berlin/g' \
               source.ics > konfi.ics
-          # (Optional) X-WR-TIMEZONE ergänzen, falls nicht vorhanden
+
+          # X-WR-TIMEZONE ergänzen, falls nicht vorhanden
           if ! grep -q "^X-WR-TIMEZONE:" konfi.ics; then
             awk '1; /^X-WR-CALNAME:/ {print "X-WR-TIMEZONE:Europe/Berlin"}' konfi.ics > tmp && mv tmp konfi.ics
           fi
 
-      - name: Commit updated ICS (only if changed)
+      - name: Commit updated ICS (only if changed or file missing)
         run: |
           set -e
           git config user.name  "calendar-bot"
           git config user.email "bot@example.com"
-          # Falls Datei neu/anders ist, committen
-          if ! git diff --quiet -- konfi.ics 2>/dev/null; then
+
+          # Falls konfi.ics neu/anders ist -> commit/push
+          if ! git diff --quiet -- konfi.ics 2>/dev/null || [ ! -f konfi.ics ]; then
             git add konfi.ics
             git commit -m "Update ICS (auto)"
             git push
