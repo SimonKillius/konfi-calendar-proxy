@@ -2,11 +2,11 @@ name: Update ICS (Europe/Berlin)
 
 on:
   schedule:
-    - cron: "0 */6 * * *"     # alle 6h (UTC)
+    - cron: "0 */6 * * *"      # alle 6h (UTC)
   workflow_dispatch:
 
 permissions:
-  contents: write             # erlaubt Commit/Push
+  contents: write              # erlaubt Commit/Push
 
 jobs:
   build:
@@ -15,53 +15,68 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Fetch ICS with retries (alternate headers & agents)
+      - name: Fetch ICS with retries (non-fatal on 500)
+        id: fetch
         env:
           SOURCE_ICS_URL: ${{ secrets.SOURCE_ICS_URL }}
         run: |
           set -e
           echo "Fetching $SOURCE_ICS_URL"
 
-          # Versuchsreihe 1: sauberer Kalender-Request + Backoff
+          # Cache-Buster anhaengen (hilft bei launischen 500ern/Caches)
+          TS=$(date +%s)
+          URL="$SOURCE_ICS_URL"
+          case "$URL" in
+            *\?*) URL="${URL}&nocache=${TS}" ;;
+            *)    URL="${URL}?nocache=${TS}" ;;
+          esac
+
+          # Versuch 1: 'saubere' Header + Retries
           if ! curl -fsSL \
                -H "Accept: text/calendar" \
                -H "Cache-Control: no-cache" \
                -A "Mozilla/5.0 (compatible; ICSFetcher/1.0)" \
-               --retry 6 --retry-delay 10 --retry-all-errors \
-               "$SOURCE_ICS_URL" -o source.ics; then
+               --retry 6 --retry-delay 10 --retry-all-errors --retry-connrefused \
+               "$URL" -o source.ics; then
             echo "Try #1 failed, trying alternative headers/agent..."
-            # Versuchsreihe 2: andere Header/Agent
+            # Versuch 2: alternative Header/Agent
             curl -fsSL \
               -H "Accept: */*" \
               -H "Pragma: no-cache" \
               -A "curl/8.x github-actions" \
-              --retry 6 --retry-delay 10 --retry-all-errors \
-              "$SOURCE_ICS_URL" -o source.ics
+              --retry 6 --retry-delay 10 --retry-all-errors --retry-connrefused \
+              "$URL" -o source.ics || true
           fi
 
-          # Minimal-Validierung: muss wirklich iCalendar sein
-          head -n 1 source.ics | grep -q "BEGIN:VCALENDAR" || { echo "Not an ICS"; exit 1; }
+          # Wenn wir hier keine gueltige ICS haben, scheitern wir NICHT,
+          # sondern lassen die alte konfi.ics bestehen.
+          if [ ! -s source.ics ] || ! head -n 1 source.ics | grep -q "BEGIN:VCALENDAR"; then
+            echo "WARN: Outlook lieferte keine gueltige ICS (500/HTML). Behalte letzte Version."
+            echo "valid=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
-      - name: Normalize timezone to Europe/Berlin
+          echo "valid=true" >> $GITHUB_OUTPUT
+
+      - name: Normalize timezone to Europe/Berlin (only if valid)
+        if: steps.fetch.outputs.valid == 'true'
         run: |
           sed -e 's/TZID:W\. Europe Standard Time/TZID:Europe\/Berlin/g' \
               -e 's/DTSTART;TZID=W\. Europe Standard Time/DTSTART;TZID=Europe\/Berlin/g' \
               -e 's/DTEND;TZID=W\. Europe Standard Time/DTEND;TZID=Europe\/Berlin/g' \
               source.ics > konfi.ics
 
-          # X-WR-TIMEZONE ergänzen, falls nicht vorhanden
           if ! grep -q "^X-WR-TIMEZONE:" konfi.ics; then
             awk '1; /^X-WR-CALNAME:/ {print "X-WR-TIMEZONE:Europe/Berlin"}' konfi.ics > tmp && mv tmp konfi.ics
           fi
 
-      - name: Commit updated ICS (only if changed or file missing)
+      - name: Commit updated ICS (only if changed and valid)
+        if: steps.fetch.outputs.valid == 'true'
         run: |
           set -e
           git config user.name  "calendar-bot"
           git config user.email "bot@example.com"
-
-          # Falls konfi.ics neu/anders ist -> commit/push
-          if ! git diff --quiet -- konfi.ics 2>/dev/null || [ ! -f konfi.ics ]; then
+          if [ ! -f konfi.ics ] || ! git diff --quiet -- konfi.ics 2>/dev/null; then
             git add konfi.ics
             git commit -m "Update ICS (auto)"
             git push
